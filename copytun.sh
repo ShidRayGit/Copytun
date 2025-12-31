@@ -1,251 +1,234 @@
 #!/usr/bin/env bash
-# copyTun - WaterWall Half-Duplex Tunnel Manager (systemd + multi tunnel)
-# UI: English (Assistant guidance: Persian)
-#
-# One-liner:
-#   sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/ShidRayGit/Copytun/main/copytun.sh)"
+# copytun.sh - WaterWall Half-Duplex tunnel manager (menu-based)
+# Thanks to Rad Kesvat for the WaterWall project
+# https://github.com/radkesvat/WaterWall
+# https://radkesvat.github.io/WaterWall-Docs/docs/intro
 
-set -euo pipefail
+set -Eeuo pipefail
 
-APP_NAME="copyTun"
-VERSION="1.41"
+# -----------------------------
+# Constants / paths
+# -----------------------------
+WW_VER="v1.41"
+WW_BASE="/opt/waterwall"
+WW_BIN="${WW_BASE}/bin/WaterWall"
+WW_LIBS="${WW_BASE}/libs"
 
-# ---- layout ----
-TUN_BASE="/opt/copytun"
-WW_HOME="/opt/waterwall"
-WW_BIN="${WW_HOME}/bin/WaterWall"
-WW_LIBS="${WW_HOME}/libs"
+CT_BASE="/opt/copytun"
 
-SVC_TEMPLATE="/etc/systemd/system/copytun@.service"
+SYSTEMD_TEMPLATE="/etc/systemd/system/copytun@.service"
 
-# ---- WaterWall v1.41 URLs ----
-URL_GCC_X64="https://github.com/radkesvat/WaterWall/releases/download/v1.41/Waterwall-linux-gcc-x64.zip"
-URL_GCC_X64_OLD="https://github.com/radkesvat/WaterWall/releases/download/v1.41/Waterwall-linux-gcc-x64-old-cpu.zip"
-URL_GCC_ARM64="https://github.com/radkesvat/WaterWall/releases/download/v1.41/Waterwall-linux-gcc-arm64.zip"
-URL_GCC_ARM64_OLD="https://github.com/radkesvat/WaterWall/releases/download/v1.41/Waterwall-linux-gcc-arm64-old-cpu.zip"
-URL_CLANG_X64="https://github.com/radkesvat/WaterWall/releases/download/v1.41/Waterwall-linux-clang-x64.zip"
-URL_CLANG_AVX512_X64="https://github.com/radkesvat/WaterWall/releases/download/v1.41/Waterwall-linux-clang-avx512f-x64.zip"
-
-# ---------------- helpers ----------------
-log()  { printf '%s\n' "[*] $*"; }
-warn() { printf '%s\n' "[!] $*" >&2; }
-die()  { printf '\n%s\n\n' "[ERROR] $*" >&2; exit 1; }
-
-need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (use sudo)."; }
-have_cmd()  { command -v "$1" >/dev/null 2>&1; }
-
-require_systemd() {
-  have_cmd systemctl || die "systemctl not found. systemd is required."
-  [[ -d /run/systemd/system ]] || die "systemd is not running on this host."
+# -----------------------------
+# TTY-safe input (MANDATORY)
+# -----------------------------
+tty_read() {
+  # Usage: tty_read varname "Prompt: "
+  local __var="$1"
+  local __prompt="${2:-}"
+  if [[ -n "$__prompt" ]]; then
+    printf "%s" "$__prompt" > /dev/tty
+  fi
+  local __val=""
+  IFS= read -r __val < /dev/tty
+  printf -v "$__var" "%s" "$__val"
 }
 
-# robust I/O: always read from /dev/tty (fixes bash -c / wget -qO- stdin issues)
-TTY="/dev/tty"
-require_tty() {
-  [[ -r "$TTY" ]] || die "No /dev/tty available. Use a real terminal (TTY)."
+tty_pause() {
+  printf "Press Enter to continue..." > /dev/tty
+  local _x
+  IFS= read -r _x < /dev/tty
 }
 
-clean_choice() {
-  # remove CR and whitespace
-  local s="${1:-}"
-  s="${s//$'\r'/}"
-  s="$(printf '%s' "$s" | tr -d ' \t\n')"
-  printf '%s' "$s"
+tty_clear() {
+  # Clear screen only if TTY exists
+  if [[ -t 1 ]] && [[ -c /dev/tty ]]; then
+    command -v clear >/dev/null 2>&1 && clear > /dev/tty 2>/dev/null || true
+  fi
 }
 
-pause() {
-  require_tty
-  read -r -p "Press Enter to continue... " _ < "$TTY" || true
+die() {
+  printf "ERROR: %s\n" "${1:-Unknown error}" > /dev/tty
+  exit 1
 }
 
-safe_clear() {
-  if [[ -t 1 ]] && have_cmd clear; then clear; fi
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "Please run as root (use sudo)."
+  fi
 }
 
-read_line() {
-  # read a full line from TTY
-  local prompt="$1" out
-  require_tty
-  printf '%s' "$prompt" > "$TTY"
-  IFS= read -r out < "$TTY" || out=""
-  printf '%s' "$out"
+# -----------------------------
+# WaterWall docs-aligned JSON
+# - Node structure: {name,type,settings,next}
+# - TcpListener/TcpConnector settings use keys address/port (per examples) 0
+# - HalfDuplexClient/HalfDuplexServer settings are {} and require next 1
+# - core.json structure: log{path,core,network,dns}, misc{workers,ram-profile,libs-path}, configs[...] 2
+# -----------------------------
+write_core_json() {
+  local tunnel_dir="$1"
+  local tunnel_name="$2"
+  local role="$3"              # iran | foreign
+  local config_rel="$4"        # e.g. configs/iran-halfduplex.json
+
+  mkdir -p "${tunnel_dir}/logs" "${tunnel_dir}/configs"
+
+  # Create log files (viewer expects them)
+  : > "${tunnel_dir}/logs/core.log" || true
+  : > "${tunnel_dir}/logs/network.log" || true
+  : > "${tunnel_dir}/logs/dns.log" || true
+  : > "${tunnel_dir}/logs/internal.log" || true
+
+  # WaterWall core config (we name it <TUNNEL_NAME>.json and symlink core.json -> it)
+  cat > "${tunnel_dir}/${tunnel_name}.json" <<EOF
+{
+  "log": {
+    "path": "logs/",
+    "core": {
+      "loglevel": "INFO",
+      "file": "core.log",
+      "console": false
+    },
+    "network": {
+      "loglevel": "INFO",
+      "file": "network.log",
+      "console": false
+    },
+    "dns": {
+      "loglevel": "INFO",
+      "file": "dns.log",
+      "console": false
+    }
+  },
+  "misc": {
+    "workers": 0,
+    "ram-profile": "server",
+    "libs-path": "${WW_LIBS}/"
+  },
+  "configs": ["${config_rel}"]
+}
+EOF
+
+  ln -sfn "${tunnel_dir}/${tunnel_name}.json" "${tunnel_dir}/core.json"
 }
 
-read_menu() {
-  # read a menu choice line from TTY, cleaned
-  local prompt="$1"
-  local v
-  v="$(read_line "$prompt")"
-  v="$(clean_choice "$v")"
-  printf '%s' "$v"
+write_iran_config() {
+  local tunnel_dir="$1"
+  local tunnel_name="$2"
+  local local_port="$3"
+  local foreign_ip="$4"
+  local tunnel_port="$5"
+
+  cat > "${tunnel_dir}/configs/iran-halfduplex.json" <<EOF
+{
+  "name": "${tunnel_name}-iran-halfduplex",
+  "nodes": [
+    {
+      "name": "listener",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": ${local_port}
+      },
+      "next": "halfduplex_client"
+    },
+    {
+      "name": "halfduplex_client",
+      "type": "HalfDuplexClient",
+      "settings": {},
+      "next": "connector"
+    },
+    {
+      "name": "connector",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "${foreign_ip}",
+        "port": ${tunnel_port}
+      }
+    }
+  ]
+}
+EOF
 }
 
-valid_port() {
-  local p="$1"
-  [[ "$p" =~ ^[0-9]+$ ]] || return 1
-  (( p >= 1 && p <= 65535 )) || return 1
-  return 0
+write_foreign_config() {
+  local tunnel_dir="$1"
+  local tunnel_name="$2"
+  local tunnel_port="$3"
+  local target_port="$4"
+
+  cat > "${tunnel_dir}/configs/foreign-halfduplex.json" <<EOF
+{
+  "name": "${tunnel_name}-foreign-halfduplex",
+  "nodes": [
+    {
+      "name": "listener",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": ${tunnel_port}
+      },
+      "next": "halfduplex_server"
+    },
+    {
+      "name": "halfduplex_server",
+      "type": "HalfDuplexServer",
+      "settings": {},
+      "next": "connector"
+    },
+    {
+      "name": "connector",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": ${target_port}
+      }
+    }
+  ]
+}
+EOF
 }
 
-prompt_port() {
-  local label="$1" def="${2:-}"
-  local v
-  while true; do
-    if [[ -n "$def" ]]; then
-      v="$(read_line "${label} [${def}]: ")"
-      v="${v:-$def}"
-    else
-      v="$(read_line "${label}: ")"
-    fi
-    v="$(clean_choice "$v")"
-    if valid_port "$v"; then
-      printf '%s' "$v"
-      return 0
-    fi
-    warn "Invalid port. Use 1..65535"
+write_meta_env() {
+  local tunnel_dir="$1"
+  shift
+  # remaining args are KEY=VALUE
+  : > "${tunnel_dir}/meta.env"
+  for kv in "$@"; do
+    printf "%s\n" "$kv" >> "${tunnel_dir}/meta.env"
   done
 }
 
-prompt_text() {
-  local label="$1" def="${2:-}"
-  local v
-  if [[ -n "$def" ]]; then
-    v="$(read_line "${label} [${def}]: ")"
-    v="${v:-$def}"
+load_meta_env() {
+  local tunnel_dir="$1"
+  # shellcheck disable=SC1090
+  if [[ -f "${tunnel_dir}/meta.env" ]]; then
+    set -a
+    # meta.env is generated by this script (key=value, no spaces). Still, guard with 'source'.
+    source "${tunnel_dir}/meta.env"
+    set +a
   else
-    v="$(read_line "${label}: ")"
-  fi
-  v="${v//$'\r'/}"
-  printf '%s' "$v"
-}
-
-sanitize_name() {
-  local n="$1"
-  [[ -n "$n" ]] || return 1
-  [[ "$n" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
-  return 0
-}
-
-download_file() {
-  local url="$1" out="$2"
-  if have_cmd wget; then
-    wget -qO "$out" "$url"
-  elif have_cmd curl; then
-    curl -fsSL "$url" -o "$out"
-  else
-    die "Neither wget nor curl is installed."
+    return 1
   fi
 }
 
-ensure_unzip() {
-  have_cmd unzip && return 0
-  warn "unzip not found. Installing..."
-  if have_cmd apt-get; then
-    apt-get update -y >/dev/null
-    apt-get install -y unzip >/dev/null
-  elif have_cmd dnf; then
-    dnf install -y unzip >/dev/null
-  elif have_cmd yum; then
-    yum install -y unzip >/dev/null
-  else
-    die "No supported package manager found. Install unzip manually."
-  fi
-}
-
-# ---------------- WaterWall install ----------------
-pick_waterwall_url() {
-  local arch
-  arch="$(uname -m)"
-
-  printf '\nSelect WaterWall binary (v%s):\n' "$VERSION"
-  printf '%s\n' "---------------------------------"
-
-  if [[ "$arch" == "x86_64" ]]; then
-    printf '%s\n' "1) Auto (recommended: old-cpu)"
-    printf '%s\n' "2) amd64 gcc x64"
-    printf '%s\n' "3) amd64 gcc x64 old-cpu (fixes Illegal instruction)"
-    printf '%s\n' "4) amd64 clang x64"
-    printf '%s\n' "5) amd64 clang avx512 (very new CPUs only)"
-    while true; do
-      local c
-      c="$(read_menu "Choice: ")"
-      case "${c:-1}" in
-        1) printf '%s' "$URL_GCC_X64_OLD"; return 0 ;;
-        2) printf '%s' "$URL_GCC_X64"; return 0 ;;
-        3) printf '%s' "$URL_GCC_X64_OLD"; return 0 ;;
-        4) printf '%s' "$URL_CLANG_X64"; return 0 ;;
-        5) printf '%s' "$URL_CLANG_AVX512_X64"; return 0 ;;
-        *) warn "Invalid choice." ;;
-      esac
-    done
-  elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-    printf '%s\n' "1) Auto (recommended)"
-    printf '%s\n' "2) arm64 gcc"
-    printf '%s\n' "3) arm64 gcc old-cpu"
-    while true; do
-      local c
-      c="$(read_menu "Choice: ")"
-      case "${c:-1}" in
-        1|2) printf '%s' "$URL_GCC_ARM64"; return 0 ;;
-        3)   printf '%s' "$URL_GCC_ARM64_OLD"; return 0 ;;
-        *) warn "Invalid choice." ;;
-      esac
-    done
-  else
-    die "Unsupported architecture: $arch"
-  fi
-}
-
-install_waterwall_if_needed() {
-  mkdir -p "${WW_HOME}/bin" "$WW_LIBS" "$TUN_BASE"
-  [[ -x "$WW_BIN" ]] && return 0
-
-  ensure_unzip
-
-  local url tmpzip tmpdir
-  url="$(pick_waterwall_url)"
-  tmpzip="$(mktemp -t waterwall_XXXXXX.zip)"
-  tmpdir="$(mktemp -d -t waterwall_ex_XXXXXX)"
-
-  log "Downloading WaterWall..."
-  download_file "$url" "$tmpzip"
-
-  log "Extracting..."
-  unzip -o "$tmpzip" -d "$tmpdir" >/dev/null
-
-  local found
-  found="$(find "$tmpdir" -maxdepth 3 -type f \( -name 'WaterWall' -o -name 'Waterwall' \) -print -quit || true)"
-  [[ -n "$found" ]] || die "WaterWall binary not found inside the zip."
-
-  cp -f "$found" "$WW_BIN"
-  chmod +x "$WW_BIN"
-
-  if [[ -d "$tmpdir/libs" ]]; then
-    cp -rf "$tmpdir/libs/." "$WW_LIBS/" || true
+# -----------------------------
+# systemd template
+# -----------------------------
+ensure_systemd_template() {
+  if [[ -f "${SYSTEMD_TEMPLATE}" ]]; then
+    return 0
   fi
 
-  rm -f "$tmpzip"
-  rm -rf "$tmpdir"
-
-  log "Installed WaterWall: $WW_BIN"
-}
-
-# ---------------- systemd ----------------
-ensure_service_template() {
-  require_systemd
-  [[ -f "$SVC_TEMPLATE" ]] && return 0
-
-  log "Creating systemd service template: $SVC_TEMPLATE"
-  cat > "$SVC_TEMPLATE" <<EOF
+  cat > "${SYSTEMD_TEMPLATE}" <<'EOF'
 [Unit]
-Description=copyTun WaterWall Tunnel (%i)
+Description=copytun WaterWall Tunnel (%i)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${TUN_BASE}/%i
-ExecStart=${WW_BIN}
+WorkingDirectory=/opt/copytun/%i
+ExecStart=/opt/waterwall/bin/WaterWall
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -254,478 +237,543 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
+  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
-svc_name() { printf 'copytun@%s.service' "$1"; }
+svc_name() {
+  local tn="$1"
+  printf "copytun@%s.service" "$tn"
+}
 
 svc_enable_start() {
-  systemctl daemon-reload
-  systemctl enable --now "$(svc_name "$1")" >/dev/null
+  local tn="$1"
+  ensure_systemd_template
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now "$(svc_name "$tn")" >/dev/null 2>&1 || true
 }
 
-svc_restart() { systemctl restart "$(svc_name "$1")"; }
-svc_stop()    { systemctl stop "$(svc_name "$1")" || true; }
-
-svc_status() {
-  local s
-  s="$(svc_name "$1")"
-  systemctl --no-pager status "$s" || true
+svc_restart() {
+  local tn="$1"
+  ensure_systemd_template
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl restart "$(svc_name "$tn")" >/dev/null 2>&1 || true
 }
 
-svc_journal() {
-  local s
-  s="$(svc_name "$1")"
-  journalctl -u "$s" -n 120 --no-pager || true
+svc_stop_disable() {
+  local tn="$1"
+  systemctl stop "$(svc_name "$tn")" >/dev/null 2>&1 || true
+  systemctl disable "$(svc_name "$tn")" >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
-# ---------------- tunnel files ----------------
-tun_dir() { printf '%s/%s' "$TUN_BASE" "$1"; }
-meta_file(){ printf '%s/meta.env' "$(tun_dir "$1")"; }
-
-write_meta() {
-  local name="$1"; shift
-  local f; f="$(meta_file "$name")"
-  {
-    printf '%s\n' "# generated by copyTun"
-    printf 'UPDATED_AT=%s\n' "$(date -Is)"
-    for kv in "$@"; do printf '%s\n' "$kv"; done
-  } > "$f"
+svc_is_active() {
+  local tn="$1"
+  systemctl is-active --quiet "$(svc_name "$tn")"
 }
 
-load_meta() {
-  local name="$1"
-  local f; f="$(meta_file "$name")"
-  [[ -f "$f" ]] || return 1
+# -----------------------------
+# WaterWall installer (v1.41)
+# Assets (linux) appear in release list 3
+# -----------------------------
+detect_arch() {
+  local a
+  a="$(uname -m 2>/dev/null || echo unknown)"
+  case "$a" in
+    x86_64|amd64) echo "x86_64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "unknown" ;;
+  esac
+}
 
-  ROLE=""
-  LOCAL_LISTEN_PORT=""
-  TUNNEL_PORT=""
-  FOREIGN_IP=""
-  LISTEN_PORT=""
-  TARGET_PORT=""
-  TARGET_ADDR="127.0.0.1"
+ensure_deps() {
+  # best-effort install via available package manager; otherwise rely on existing tools
+  local need=()
+  command -v wget >/dev/null 2>&1 || need+=("wget")
+  command -v unzip >/dev/null 2>&1 || need+=("unzip")
 
-  while IFS='=' read -r k v; do
-    [[ -z "${k:-}" ]] && continue
-    [[ "$k" =~ ^# ]] && continue
-    v="${v%$'\r'}"
-    case "$k" in
-      ROLE) ROLE="$v" ;;
-      LOCAL_LISTEN_PORT) LOCAL_LISTEN_PORT="$v" ;;
-      TUNNEL_PORT) TUNNEL_PORT="$v" ;;
-      FOREIGN_IP) FOREIGN_IP="$v" ;;
-      LISTEN_PORT) LISTEN_PORT="$v" ;;
-      TARGET_PORT) TARGET_PORT="$v" ;;
-      TARGET_ADDR) TARGET_ADDR="$v" ;;
+  if [[ "${#need[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  # Try common managers
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y "${need[@]}" >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y "${need[@]}" >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "${need[@]}" >/dev/null 2>&1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm "${need[@]}" >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "${need[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
+select_ww_asset() {
+  local arch="$1"
+  local choice=""
+  tty_clear
+  printf "WaterWall (%s) is not installed. Let's install %s.\n\n" "$WW_BIN" "$WW_VER" > /dev/tty
+
+  if [[ "$arch" == "x86_64" ]]; then
+    printf "Select your Linux x86_64 build:\n" > /dev/tty
+    printf "1) gcc x64\n" > /dev/tty
+    printf "2) gcc x64 old-cpu (avoid Illegal instruction)\n" > /dev/tty
+    printf "3) clang x64\n" > /dev/tty
+    printf "4) clang avx512 (very new CPUs only)\n" > /dev/tty
+    tty_read choice "Enter choice [1-4]: "
+    case "$choice" in
+      1) echo "Waterwall-linux-gcc-x64.zip" ;;
+      2) echo "Waterwall-linux-gcc-x64-old-cpu.zip" ;;
+      3) echo "Waterwall-linux-clang-x64.zip" ;;
+      4) echo "Waterwall-linux-clang-avx512f-x64.zip" ;;
+      *) die "Invalid choice." ;;
     esac
-  done < "$f"
-  return 0
-}
-
-write_core_wrapper() {
-  local name="$1" role_profile="$2" cfg_rel="$3"
-  local dir; dir="$(tun_dir "$name")"
-  cat > "${dir}/${name}.json" <<JSON
-{
-  "log": {
-    "path": "logs/",
-    "core":     { "loglevel": "INFO",  "file": "core.log",     "console": true },
-    "network":  { "loglevel": "INFO",  "file": "network.log",  "console": true },
-    "dns":      { "loglevel": "ERROR", "file": "dns.log",      "console": true },
-    "internal": { "loglevel": "INFO",  "file": "internal.log", "console": true }
-  },
-  "misc": {
-    "workers": 0,
-    "mtu": 1500,
-    "ram-profile": "${role_profile}",
-    "libs-path": "libs/"
-  },
-  "configs": ["${cfg_rel}"]
-}
-JSON
-  ln -sfn "${name}.json" "${dir}/core.json"
-}
-
-write_config_iran() {
-  local name="$1" local_port="$2" foreign_ip="$3" tunnel_port="$4"
-  local dir; dir="$(tun_dir "$name")"
-
-  cat > "${dir}/configs/iran-halfduplex.json" <<JSON
-{
-  "name": "${name}_iran_halfduplex",
-  "config-version": 1,
-  "core-minimum-version": 1,
-  "nodes": [
-    {
-      "name": "iran_in",
-      "type": "TcpListener",
-      "settings": {
-        "address": "0.0.0.0",
-        "port": ${local_port},
-        "nodelay": true
-      },
-      "next": "hd_client"
-    },
-    {
-      "name": "hd_client",
-      "type": "HalfDuplexClient",
-      "settings": {},
-      "next": "to_foreign"
-    },
-    {
-      "name": "to_foreign",
-      "type": "TcpConnector",
-      "settings": {
-        "address": "${foreign_ip}",
-        "port": ${tunnel_port},
-        "nodelay": true
-      }
-    }
-  ]
-}
-JSON
-
-  write_core_wrapper "$name" "client" "configs/iran-halfduplex.json"
-}
-
-write_config_foreign() {
-  local name="$1" listen_port="$2" target_port="$3" target_addr="${4:-127.0.0.1}"
-  local dir; dir="$(tun_dir "$name")"
-
-  cat > "${dir}/configs/foreign-halfduplex.json" <<JSON
-{
-  "name": "${name}_foreign_halfduplex",
-  "config-version": 1,
-  "core-minimum-version": 1,
-  "nodes": [
-    {
-      "name": "foreign_in",
-      "type": "TcpListener",
-      "settings": {
-        "address": "0.0.0.0",
-        "port": ${listen_port},
-        "nodelay": true
-      },
-      "next": "hd_server"
-    },
-    {
-      "name": "hd_server",
-      "type": "HalfDuplexServer",
-      "settings": {},
-      "next": "to_target"
-    },
-    {
-      "name": "to_target",
-      "type": "TcpConnector",
-      "settings": {
-        "address": "${target_addr}",
-        "port": ${target_port},
-        "nodelay": true
-      }
-    }
-  ]
-}
-JSON
-
-  write_core_wrapper "$name" "server" "configs/foreign-halfduplex.json"
-}
-
-# ---------------- UI flows ----------------
-create_tunnel() {
-  install_waterwall_if_needed
-  ensure_service_template
-
-  printf '\n%s\n' "Create tunnel"
-  printf '%s\n' "--------------------------"
-
-  local name
-  while true; do
-    name="$(prompt_text "Tunnel name (A-Z a-z 0-9 _ -)")"
-    name="$(clean_choice "$name")"
-    sanitize_name "$name" && break
-    warn "Invalid name. Allowed: letters, digits, underscore, dash."
-  done
-
-  local dir; dir="$(tun_dir "$name")"
-  [[ -e "$dir" ]] && die "Tunnel already exists: $name"
-
-  mkdir -p "$dir/configs" "$dir/logs"
-  ln -sfn "$WW_LIBS" "$dir/libs"
-
-  printf '\n%s\n' "Where are you running this?"
-  printf '%s\n' "1) Iran server (Client / HalfDuplexClient)"
-  printf '%s\n' "2) Foreign server (Server / HalfDuplexServer)"
-
-  local role
-  role="$(read_menu "Choice (1/2): ")"
-
-  if [[ "$role" == "1" ]]; then
-    local local_port tunnel_port foreign_ip
-    local_port="$(prompt_port "Local LISTEN port (user connects here)" "5055")"
-    tunnel_port="$(prompt_port "Tunnel port (connect to foreign)" "449")"
-    foreign_ip="$(prompt_text "Foreign server IP")"
-
-    write_config_iran "$name" "$local_port" "$foreign_ip" "$tunnel_port"
-    write_meta "$name" \
-      "ROLE=iran" \
-      "LOCAL_LISTEN_PORT=${local_port}" \
-      "TUNNEL_PORT=${tunnel_port}" \
-      "FOREIGN_IP=${foreign_ip}"
-
-  elif [[ "$role" == "2" ]]; then
-    local target_port listen_port
-    target_port="$(prompt_port "Target service port on THIS server (e.g. Xray inbound)" "5055")"
-    listen_port="$(prompt_port "Tunnel LISTEN port (Iran connects here)" "449")"
-
-    write_config_foreign "$name" "$listen_port" "$target_port" "127.0.0.1"
-    write_meta "$name" \
-      "ROLE=foreign" \
-      "LISTEN_PORT=${listen_port}" \
-      "TARGET_PORT=${target_port}" \
-      "TARGET_ADDR=127.0.0.1"
+  elif [[ "$arch" == "arm64" ]]; then
+    printf "Select your Linux arm64 build:\n" > /dev/tty
+    printf "1) gcc arm64\n" > /dev/tty
+    printf "2) gcc arm64 old-cpu\n" > /dev/tty
+    tty_read choice "Enter choice [1-2]: "
+    case "$choice" in
+      1) echo "Waterwall-linux-gcc-arm64.zip" ;;
+      2) echo "Waterwall-linux-gcc-arm64-old-cpu.zip" ;;
+      *) die "Invalid choice." ;;
+    esac
   else
-    die "Invalid role."
+    die "Unsupported architecture: $(uname -m)."
   fi
-
-  svc_enable_start "$name"
-  log "Tunnel created and enabled: $name"
-  printf '\n'
-  svc_status "$name" || true
-  pause
 }
 
+install_waterwall() {
+  if [[ -x "$WW_BIN" ]]; then
+    return 0
+  fi
+
+  ensure_deps
+
+  local arch asset url tmpd
+  arch="$(detect_arch)"
+  asset="$(select_ww_asset "$arch")"
+  url="https://github.com/radkesvat/WaterWall/releases/download/${WW_VER}/${asset}"
+
+  tmpd="$(mktemp -d)"
+  mkdir -p "${WW_BASE}/bin" "${WW_BASE}/libs"
+
+  printf "\nDownloading: %s\n" "$url" > /dev/tty
+  wget -qO "${tmpd}/ww.zip" "$url" || die "Failed to download WaterWall asset."
+
+  unzip -q "${tmpd}/ww.zip" -d "${tmpd}/ww" || die "Failed to unzip WaterWall asset."
+
+  # The release zips include WaterWall binary and libs directory (per docs style).
+  # Best-effort locate binary and libs.
+  local found_bin=""
+  found_bin="$(find "${tmpd}/ww" -maxdepth 3 -type f -name 'WaterWall' 2>/dev/null | head -n 1 || true)"
+  [[ -n "$found_bin" ]] || die "Could not find WaterWall binary inside the zip."
+
+  # Copy binary
+  install -m 0755 "$found_bin" "${WW_BIN}"
+
+  # Copy libs (if present)
+  local found_libs=""
+  found_libs="$(find "${tmpd}/ww" -maxdepth 3 -type d -name 'libs' 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$found_libs" ]]; then
+    rm -rf "${WW_LIBS}" || true
+    mkdir -p "${WW_LIBS}"
+    cp -a "${found_libs}/." "${WW_LIBS}/"
+  fi
+
+  rm -rf "$tmpd" || true
+
+  if [[ ! -x "$WW_BIN" ]]; then
+    die "WaterWall installation failed (binary not executable)."
+  fi
+
+  printf "WaterWall installed at: %s\n" "$WW_BIN" > /dev/tty
+  tty_pause
+}
+
+# -----------------------------
+# Validation helpers
+# -----------------------------
+valid_name() {
+  local n="$1"
+  [[ "$n" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+# -----------------------------
+# Tunnel create / edit
+# -----------------------------
+create_tunnel() {
+  install_waterwall
+  ensure_systemd_template
+
+  mkdir -p "${CT_BASE}"
+
+  tty_clear
+  local tn
+  tty_read tn "Enter tunnel name (A-Z a-z 0-9 _ -): "
+  valid_name "$tn" || die "Invalid tunnel name."
+  local tdir="${CT_BASE}/${tn}"
+  if [[ -d "$tdir" ]]; then
+    die "Tunnel already exists: ${tn}"
+  fi
+
+  local role_choice
+  printf "\nSelect role:\n" > /dev/tty
+  printf "1) Iran server (Client / HalfDuplexClient)\n" > /dev/tty
+  printf "2) Foreign server (Server / HalfDuplexServer)\n" > /dev/tty
+  tty_read role_choice "Enter choice [1-2]: "
+
+  mkdir -p "$tdir/configs" "$tdir/logs"
+
+  if [[ "$role_choice" == "1" ]]; then
+    # Iran server (client)
+    local local_port tunnel_port foreign_ip
+    tty_read local_port "Local listen port (users connect here, e.g. 5055): "
+    valid_port "$local_port" || die "Invalid port."
+
+    tty_read tunnel_port "Tunnel port (connects to foreign server, e.g. 449): "
+    valid_port "$tunnel_port" || die "Invalid port."
+
+    tty_read foreign_ip "Foreign server IP (or hostname): "
+    [[ -n "$foreign_ip" ]] || die "Foreign IP/host cannot be empty."
+
+    write_iran_config "$tdir" "$tn" "$local_port" "$foreign_ip" "$tunnel_port"
+    write_foreign_config "$tdir" "$tn" "$tunnel_port" "$local_port"  # kept for reference; not used unless role changed manually
+    write_core_json "$tdir" "$tn" "iran" "configs/iran-halfduplex.json"
+    write_meta_env "$tdir" \
+      "TUNNEL_NAME=${tn}" \
+      "ROLE=iran" \
+      "IRAN_LOCAL_PORT=${local_port}" \
+      "IRAN_TUNNEL_PORT=${tunnel_port}" \
+      "IRAN_FOREIGN_IP=${foreign_ip}"
+
+  elif [[ "$role_choice" == "2" ]]; then
+    # Foreign server (server)
+    local target_port tunnel_port
+    tty_read target_port "Target service port (e.g. Xray inbound, e.g. 5055): "
+    valid_port "$target_port" || die "Invalid port."
+
+    tty_read tunnel_port "Tunnel listen port (e.g. 449): "
+    valid_port "$tunnel_port" || die "Invalid port."
+
+    write_foreign_config "$tdir" "$tn" "$tunnel_port" "$target_port"
+    write_iran_config "$tdir" "$tn" "$target_port" "CHANGE_ME" "$tunnel_port" # kept for reference; not used unless role changed manually
+    write_core_json "$tdir" "$tn" "foreign" "configs/foreign-halfduplex.json"
+    write_meta_env "$tdir" \
+      "TUNNEL_NAME=${tn}" \
+      "ROLE=foreign" \
+      "FOREIGN_TARGET_PORT=${target_port}" \
+      "FOREIGN_TUNNEL_PORT=${tunnel_port}"
+  else
+    rm -rf "$tdir" || true
+    die "Invalid choice."
+  fi
+
+  svc_enable_start "$tn"
+
+  printf "\nTunnel created: %s\n" "$tn" > /dev/tty
+  printf "Service: %s\n" "$(svc_name "$tn")" > /dev/tty
+  tty_pause
+}
+
+regenerate_from_meta() {
+  local tn="$1"
+  local tdir="${CT_BASE}/${tn}"
+  [[ -d "$tdir" ]] || die "Tunnel dir not found."
+
+  load_meta_env "$tdir" || die "meta.env missing."
+
+  mkdir -p "$tdir/configs" "$tdir/logs"
+
+  if [[ "${ROLE:-}" == "iran" ]]; then
+    valid_port "${IRAN_LOCAL_PORT:-}" || die "Invalid meta: IRAN_LOCAL_PORT"
+    valid_port "${IRAN_TUNNEL_PORT:-}" || die "Invalid meta: IRAN_TUNNEL_PORT"
+    [[ -n "${IRAN_FOREIGN_IP:-}" ]] || die "Invalid meta: IRAN_FOREIGN_IP"
+
+    write_iran_config "$tdir" "$tn" "$IRAN_LOCAL_PORT" "$IRAN_FOREIGN_IP" "$IRAN_TUNNEL_PORT"
+    write_foreign_config "$tdir" "$tn" "$IRAN_TUNNEL_PORT" "$IRAN_LOCAL_PORT"
+    write_core_json "$tdir" "$tn" "iran" "configs/iran-halfduplex.json"
+
+  elif [[ "${ROLE:-}" == "foreign" ]]; then
+    valid_port "${FOREIGN_TARGET_PORT:-}" || die "Invalid meta: FOREIGN_TARGET_PORT"
+    valid_port "${FOREIGN_TUNNEL_PORT:-}" || die "Invalid meta: FOREIGN_TUNNEL_PORT"
+
+    write_foreign_config "$tdir" "$tn" "$FOREIGN_TUNNEL_PORT" "$FOREIGN_TARGET_PORT"
+    write_iran_config "$tdir" "$tn" "$FOREIGN_TARGET_PORT" "CHANGE_ME" "$FOREIGN_TUNNEL_PORT"
+    write_core_json "$tdir" "$tn" "foreign" "configs/foreign-halfduplex.json"
+  else
+    die "Unknown ROLE in meta.env (expected iran or foreign)."
+  fi
+}
+
+edit_tunnel() {
+  local tn="$1"
+  local tdir="${CT_BASE}/${tn}"
+  load_meta_env "$tdir" || die "meta.env missing."
+
+  tty_clear
+  printf "Editing tunnel: %s\nRole: %s\n\n" "$tn" "$ROLE" > /dev/tty
+
+  if [[ "$ROLE" == "iran" ]]; then
+    printf "1) Edit Foreign IP (current: %s)\n" "${IRAN_FOREIGN_IP:-}" > /dev/tty
+    printf "2) Edit Local listen port (current: %s)\n" "${IRAN_LOCAL_PORT:-}" > /dev/tty
+    printf "3) Edit Tunnel port (current: %s)\n" "${IRAN_TUNNEL_PORT:-}" > /dev/tty
+    printf "0) Back\n" > /dev/tty
+    local c v
+    tty_read c "Choose: "
+    case "$c" in
+      1) tty_read v "New Foreign IP/host: "; [[ -n "$v" ]] || die "Empty."; IRAN_FOREIGN_IP="$v" ;;
+      2) tty_read v "New Local listen port: "; valid_port "$v" || die "Invalid port."; IRAN_LOCAL_PORT="$v" ;;
+      3) tty_read v "New Tunnel port: "; valid_port "$v" || die "Invalid port."; IRAN_TUNNEL_PORT="$v" ;;
+      0) return 0 ;;
+      *) die "Invalid choice." ;;
+    esac
+
+    write_meta_env "$tdir" \
+      "TUNNEL_NAME=${tn}" \
+      "ROLE=iran" \
+      "IRAN_LOCAL_PORT=${IRAN_LOCAL_PORT}" \
+      "IRAN_TUNNEL_PORT=${IRAN_TUNNEL_PORT}" \
+      "IRAN_FOREIGN_IP=${IRAN_FOREIGN_IP}"
+
+  elif [[ "$ROLE" == "foreign" ]]; then
+    printf "1) Edit Target service port (current: %s)\n" "${FOREIGN_TARGET_PORT:-}" > /dev/tty
+    printf "2) Edit Tunnel listen port (current: %s)\n" "${FOREIGN_TUNNEL_PORT:-}" > /dev/tty
+    printf "0) Back\n" > /dev/tty
+    local c v
+    tty_read c "Choose: "
+    case "$c" in
+      1) tty_read v "New Target service port: "; valid_port "$v" || die "Invalid port."; FOREIGN_TARGET_PORT="$v" ;;
+      2) tty_read v "New Tunnel listen port: "; valid_port "$v" || die "Invalid port."; FOREIGN_TUNNEL_PORT="$v" ;;
+      0) return 0 ;;
+      *) die "Invalid choice." ;;
+    esac
+
+    write_meta_env "$tdir" \
+      "TUNNEL_NAME=${tn}" \
+      "ROLE=foreign" \
+      "FOREIGN_TARGET_PORT=${FOREIGN_TARGET_PORT}" \
+      "FOREIGN_TUNNEL_PORT=${FOREIGN_TUNNEL_PORT}"
+  else
+    die "Unknown ROLE in meta.env."
+  fi
+
+  regenerate_from_meta "$tn"
+  svc_restart "$tn"
+
+  printf "\nUpdated and restarted: %s\n" "$(svc_name "$tn")" > /dev/tty
+  tty_pause
+}
+
+delete_tunnel() {
+  local tn="$1"
+  local tdir="${CT_BASE}/${tn}"
+  [[ -d "$tdir" ]] || die "Tunnel not found."
+
+  tty_clear
+  printf "Delete tunnel '%s'?\nType YES to confirm: " "$tn" > /dev/tty
+  local ans
+  IFS= read -r ans < /dev/tty
+  if [[ "$ans" != "YES" ]]; then
+    printf "Cancelled.\n" > /dev/tty
+    tty_pause
+    return 0
+  fi
+
+  svc_stop_disable "$tn"
+  rm -rf "$tdir" || true
+
+  printf "Deleted tunnel: %s\n" "$tn" > /dev/tty
+  tty_pause
+}
+
+# -----------------------------
+# List / manage tunnels
+# -----------------------------
 list_tunnels() {
-  mkdir -p "$TUN_BASE"
-  find "$TUN_BASE" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
-}
+  mkdir -p "${CT_BASE}"
+  local dirs=()
+  local d
+  while IFS= read -r -d '' d; do
+    dirs+=("$d")
+  done < <(find "${CT_BASE}" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
 
-print_tunnel_table() {
-  local names
-  mapfile -t names < <(list_tunnels)
-  if [[ "${#names[@]}" -eq 0 ]]; then
-    printf '%s\n' "No tunnels found."
-    return 1
+  if [[ "${#dirs[@]}" -eq 0 ]]; then
+    tty_clear
+    printf "No tunnels found.\n" > /dev/tty
+    tty_pause
+    return 0
   fi
 
-  printf '\n%s\n' "Tunnels:"
-  printf '%s\n' "--------------------------------------------------------------------------------"
-  local i=1
-  for n in "${names[@]}"; do
-    local role="-" detail="-"
-    if load_meta "$n"; then
-      role="$ROLE"
-      if [[ "$ROLE" == "iran" ]]; then
-        detail="listen:${LOCAL_LISTEN_PORT} => ${FOREIGN_IP}:${TUNNEL_PORT}"
-      elif [[ "$ROLE" == "foreign" ]]; then
-        detail="listen:${LISTEN_PORT} => ${TARGET_ADDR}:${TARGET_PORT}"
+  tty_clear
+  printf "Tunnels:\n" > /dev/tty
+  printf "---------------------------------------------\n" > /dev/tty
+
+  local i=0
+  local names=()
+  for d in "${dirs[@]}"; do
+    i=$((i+1))
+    local tn
+    tn="$(basename "$d")"
+    names+=("$tn")
+
+    local role="unknown" summary="(no meta.env)"
+    if load_meta_env "$d" 2>/dev/null; then
+      role="${ROLE:-unknown}"
+      if [[ "$role" == "iran" ]]; then
+        summary="local:${IRAN_LOCAL_PORT:-?} -> ${IRAN_FOREIGN_IP:-?}:${IRAN_TUNNEL_PORT:-?}"
+      elif [[ "$role" == "foreign" ]]; then
+        summary="0.0.0.0:${FOREIGN_TUNNEL_PORT:-?} -> 127.0.0.1:${FOREIGN_TARGET_PORT:-?}"
       fi
     fi
 
-    local svc="copytun@${n}.service"
     local st="inactive"
-    systemctl is-active --quiet "$svc" && st="active" || true
+    if svc_is_active "$tn"; then st="active"; fi
 
-    printf "%2d) %-20s  role=%-7s  status=%-8s  %s\n" "$i" "$n" "$role" "$st" "$detail"
-    ((i++))
+    printf "%2d) %-20s role:%-7s  %-35s  [%s]\n" "$i" "$tn" "$role" "$summary" "$st" > /dev/tty
   done
-  printf '%s\n' "--------------------------------------------------------------------------------"
-  return 0
+
+  printf "---------------------------------------------\n" > /dev/tty
+  printf "Select a tunnel by number (or 0 to back)\n" > /dev/tty
+  local choice
+  tty_read choice "Enter: "
+  if [[ "$choice" == "0" ]]; then
+    return 0
+  fi
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
+  (( choice >= 1 && choice <= ${#names[@]} )) || die "Out of range."
+
+  manage_tunnel "${names[$((choice-1))]}"
 }
 
-choose_log_file_menu() {
-  local name="$1"
-  local dir; dir="$(tun_dir "$name")"
-  local logs_dir="${dir}/logs"
-
-  [[ -d "$logs_dir" ]] || { warn "No logs directory."; return 1; }
+view_log_files() {
+  local tn="$1"
+  local tdir="${CT_BASE}/${tn}"
+  local ldir="${tdir}/logs"
+  [[ -d "$ldir" ]] || die "Logs directory not found."
 
   local files=()
   local f
   for f in core.log network.log dns.log internal.log; do
-    [[ -f "${logs_dir}/${f}" ]] && files+=("$f")
+    if [[ -f "${ldir}/${f}" ]]; then
+      files+=("${f}")
+    fi
   done
 
+  tty_clear
   if [[ "${#files[@]}" -eq 0 ]]; then
-    warn "No log files found yet. (Try starting the service first.)"
-    return 1
+    printf "No log files found in %s\n" "$ldir" > /dev/tty
+    tty_pause
+    return 0
   fi
 
-  printf '\n%s\n' "Log files:"
-  local i=1
+  printf "Log files for %s:\n" "$tn" > /dev/tty
+  local i=0
   for f in "${files[@]}"; do
-    printf "%2d) %s\n" "$i" "$f"
-    ((i++))
+    i=$((i+1))
+    printf "%d) %s\n" "$i" "$f" > /dev/tty
   done
-  printf " 0) Back\n"
+  printf "0) Back\n" > /dev/tty
 
   local c
-  c="$(read_menu "Select a file: ")"
-  [[ "$c" == "0" || -z "$c" ]] && return 0
-  [[ "$c" =~ ^[0-9]+$ ]] || { warn "Invalid number."; return 1; }
+  tty_read c "Choose file: "
+  if [[ "$c" == "0" ]]; then
+    return 0
+  fi
+  [[ "$c" =~ ^[0-9]+$ ]] || die "Invalid selection."
+  (( c >= 1 && c <= ${#files[@]} )) || die "Out of range."
+  local selected="${files[$((c-1))]}"
 
-  local idx=$((c-1))
-  (( idx >= 0 && idx < ${#files[@]} )) || { warn "Out of range."; return 1; }
-
-  local chosen="${files[$idx]}"
-  printf '\n%s\n' "1) tail -n 200"
-  printf '%s\n' "2) tail -f (live)"
-  printf '%s\n' "0) Back"
+  tty_clear
+  printf "1) tail -n 200\n" > /dev/tty
+  printf "2) tail -f (live)\n" > /dev/tty
+  printf "0) Back\n" > /dev/tty
   local mode
-  mode="$(read_menu "Choice: ")"
-
+  tty_read mode "Choose: "
   case "$mode" in
     1)
-      printf '\n---- %s ----\n' "${logs_dir}/${chosen}"
-      tail -n 200 "${logs_dir}/${chosen}" || true
+      tail -n 200 "${ldir}/${selected}" | sed 's/\r$//' > /dev/tty
+      printf "\n" > /dev/tty
+      tty_pause
       ;;
     2)
-      printf '\n---- live: %s (Ctrl+C to stop) ----\n' "${logs_dir}/${chosen}"
-      tail -f "${logs_dir}/${chosen}" || true
+      printf "Live mode. Press Ctrl+C to stop.\n\n" > /dev/tty
+      # tail -f writes to stdout; redirect to tty for safety
+      tail -f "${ldir}/${selected}" > /dev/tty
       ;;
     0) return 0 ;;
-    *) warn "Invalid choice." ;;
+    *) die "Invalid choice." ;;
   esac
-  return 0
 }
 
-edit_tunnel() {
-  local name="$1"
-  local dir; dir="$(tun_dir "$name")"
-  load_meta "$name" || die "Missing meta.env for tunnel: $name"
+manage_tunnel() {
+  local tn="$1"
+  local sname
+  sname="$(svc_name "$tn")"
 
-  printf '\nEdit tunnel: %s (role=%s)\n' "$name" "$ROLE"
-  printf '%s\n' "----------------------------------------"
-
-  if [[ "$ROLE" == "iran" ]]; then
-    local new_local new_tunnel new_ip
-    new_local="$(prompt_port "Local LISTEN port" "$LOCAL_LISTEN_PORT")"
-    new_tunnel="$(prompt_port "Tunnel port (connect to foreign)" "$TUNNEL_PORT")"
-    new_ip="$(prompt_text "Foreign server IP" "$FOREIGN_IP")"
-
-    write_config_iran "$name" "$new_local" "$new_ip" "$new_tunnel"
-    write_meta "$name" \
-      "ROLE=iran" \
-      "LOCAL_LISTEN_PORT=${new_local}" \
-      "TUNNEL_PORT=${new_tunnel}" \
-      "FOREIGN_IP=${new_ip}"
-
-  elif [[ "$ROLE" == "foreign" ]]; then
-    local new_target new_listen
-    new_target="$(prompt_port "Target service port" "$TARGET_PORT")"
-    new_listen="$(prompt_port "Tunnel LISTEN port" "$LISTEN_PORT")"
-
-    write_config_foreign "$name" "$new_listen" "$new_target" "127.0.0.1"
-    write_meta "$name" \
-      "ROLE=foreign" \
-      "LISTEN_PORT=${new_listen}" \
-      "TARGET_PORT=${new_target}" \
-      "TARGET_ADDR=127.0.0.1"
-  else
-    die "Invalid ROLE in meta."
-  fi
-
-  svc_restart "$name"
-  log "Updated and restarted: $name"
-  pause
-}
-
-delete_tunnel() {
-  local name="$1"
-  local dir; dir="$(tun_dir "$name")"
-  local confirm
-  confirm="$(read_line "Type YES to delete '${name}': ")"
-  confirm="$(clean_choice "$confirm")"
-  [[ "$confirm" == "YES" ]] || { log "Cancelled."; pause; return 0; }
-
-  systemctl disable --now "$(svc_name "$name")" >/dev/null 2>&1 || true
-  rm -rf "$dir"
-  log "Deleted tunnel: $name"
-  pause
-}
-
-manage_tunnel_menu() {
-  local name="$1"
   while true; do
-    safe_clear
-    printf 'Manage tunnel: %s\n' "$name"
-    printf '%s\n' "------------------------------"
-    printf '%s\n' "1) Start/Restart"
-    printf '%s\n' "2) Stop"
-    printf '%s\n' "3) Status (systemctl)"
-    printf '%s\n' "4) Journal logs (journalctl)"
-    printf '%s\n' "5) Log files (core/network/dns/internal)"
-    printf '%s\n' "6) Edit settings"
-    printf '%s\n' "7) Delete tunnel"
-    printf '%s\n' "0) Back"
+    tty_clear
+    local st="inactive"
+    if svc_is_active "$tn"; then st="active"; fi
+    printf "Manage tunnel: %s  [%s]\n" "$tn" "$st" > /dev/tty
+    printf "--------------------------------\n" > /dev/tty
+    printf "1) Start / Restart\n" > /dev/tty
+    printf "2) Stop\n" > /dev/tty
+    printf "3) Service status (systemctl status)\n" > /dev/tty
+    printf "4) Service logs (journalctl -u)\n" > /dev/tty
+    printf "5) View log files\n" > /dev/tty
+    printf "6) Edit tunnel\n" > /dev/tty
+    printf "7) Delete tunnel\n" > /dev/tty
+    printf "0) Back\n" > /dev/tty
 
     local c
-    c="$(read_menu "Choice: ")"
+    tty_read c "Choose: "
     case "$c" in
-      1) svc_restart "$name"; log "Restarted."; pause ;;
-      2) svc_stop "$name"; log "Stopped."; pause ;;
-      3) svc_status "$name"; pause ;;
-      4) svc_journal "$name"; pause ;;
-      5) choose_log_file_menu "$name" || true; pause ;;
-      6) edit_tunnel "$name" ;;
-      7) delete_tunnel "$name"; return 0 ;;
+      1) svc_enable_start "$tn"; svc_restart "$tn"; printf "Restarted.\n" > /dev/tty; tty_pause ;;
+      2) systemctl stop "$sname" >/dev/null 2>&1 || true; printf "Stopped.\n" > /dev/tty; tty_pause ;;
+      3) systemctl status "$sname" --no-pager > /dev/tty 2>&1 || true; tty_pause ;;
+      4) journalctl -u "$sname" --no-pager -n 200 > /dev/tty 2>&1 || true; tty_pause ;;
+      5) view_log_files "$tn" ;;
+      6) edit_tunnel "$tn" ;;
+      7) delete_tunnel "$tn"; return 0 ;;
       0) return 0 ;;
-      *) warn "Invalid choice."; pause ;;
+      *) printf "Invalid choice.\n" > /dev/tty; tty_pause ;;
     esac
   done
 }
 
-list_manage_flow() {
-  ensure_service_template
-
-  while true; do
-    safe_clear
-    if ! print_tunnel_table; then
-      pause
-      return 0
-    fi
-
-    local sel
-    sel="$(read_menu "Select tunnel number (or 0 to back): ")"
-    [[ -z "$sel" ]] && sel="0"
-    [[ "$sel" =~ ^[0-9]+$ ]] || { warn "Enter a number."; pause; continue; }
-    [[ "$sel" == "0" ]] && return 0
-
-    local names
-    mapfile -t names < <(list_tunnels)
-    local idx=$((sel-1))
-    (( idx >= 0 && idx < ${#names[@]} )) || { warn "Out of range."; pause; continue; }
-
-    manage_tunnel_menu "${names[$idx]}"
-  done
-}
-
+# -----------------------------
+# Main menu
+# -----------------------------
 main_menu() {
   need_root
-  require_systemd
-  require_tty
-
-  mkdir -p "$TUN_BASE" "$WW_HOME/bin" "$WW_LIBS"
+  mkdir -p "${CT_BASE}"
+  ensure_systemd_template
 
   while true; do
-    safe_clear
-    printf '%s\n' "============================================="
-    printf ' %s - WaterWall Half-Duplex Manager v%s\n' "$APP_NAME" "$VERSION"
-    printf '%s\n' "============================================="
-    printf '%s\n' "1) Create tunnel"
-    printf '%s\n' "2) List / Manage tunnels"
-    printf '%s\n' "3) Exit"
-    printf '%s\n' "---------------------------------------------"
-
+    tty_clear
+    printf "copytun - WaterWall Half-Duplex tunnel manager\n" > /dev/tty
+    printf "---------------------------------------------\n" > /dev/tty
+    printf "1) Create tunnel\n" > /dev/tty
+    printf "2) List / Manage tunnels\n" > /dev/tty
+    printf "3) Exit\n" > /dev/tty
     local c
-    c="$(read_menu "Choice: ")"
+    tty_read c "Choose: "
     case "$c" in
       1) create_tunnel ;;
-      2) list_manage_flow ;;
-      3) exit 0 ;;
-      *) warn "Invalid choice."; pause ;;
+      2) list_tunnels ;;
+      3) tty_clear; exit 0 ;;
+      *) printf "Invalid choice.\n" > /dev/tty; tty_pause ;;
     esac
   done
 }
 
 main_menu
+```4
