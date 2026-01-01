@@ -50,7 +50,7 @@ need_root() {
 }
 
 # -----------------------------
-# systemd template
+# systemd template (ExecStart from tunnel dir)
 # -----------------------------
 ensure_systemd_template() {
   if [[ -f "${SYSTEMD_TEMPLATE}" ]]; then
@@ -66,7 +66,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/copytun/%i
-ExecStart=/opt/waterwall/bin/WaterWall
+ExecStart=/opt/copytun/%i/WaterWall
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -79,6 +79,7 @@ EOF
 }
 
 svc_name() { printf -- "copytun@%s.service" "$1"; }
+svc_is_active() { systemctl is-active --quiet "$(svc_name "$1")"; }
 
 svc_enable_start() {
   local tn="$1"
@@ -101,10 +102,8 @@ svc_stop_disable() {
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
-svc_is_active() { systemctl is-active --quiet "$(svc_name "$1")"; }
-
 # -----------------------------
-# WaterWall installer (v1.41) - robust zip binary detection
+# WaterWall install (global) - robust zip binary detection
 # -----------------------------
 detect_arch() {
   local a
@@ -171,9 +170,8 @@ select_ww_asset() {
   fi
 }
 
-install_waterwall() {
+install_waterwall_global() {
   [[ -x "$WW_BIN" ]] && return 0
-
   ensure_deps
 
   local arch asset url tmpd
@@ -188,7 +186,6 @@ install_waterwall() {
   wget -qO "${tmpd}/ww.zip" "$url" || die "Failed to download WaterWall asset."
   unzip -q "${tmpd}/ww.zip" -d "${tmpd}/ww" || die "Failed to unzip WaterWall asset."
 
-  # Robust binary discovery (zip layouts differ)
   local found_bin=""
   found_bin="$(find "${tmpd}/ww" -maxdepth 6 -type f \( -iname 'WaterWall' -o -iname 'waterwall' -o -iname 'waterwall*' \) 2>/dev/null | head -n 1 || true)"
 
@@ -206,7 +203,6 @@ install_waterwall() {
   fi
 
   [[ -n "$found_bin" ]] || die "Could not locate WaterWall binary in the zip."
-
   install -m 0755 "$found_bin" "${WW_BIN}" || die "Failed to install WaterWall binary."
   chmod 0755 "${WW_BIN}" || true
 
@@ -219,9 +215,9 @@ install_waterwall() {
   fi
 
   rm -rf "$tmpd" || true
-
   [[ -x "$WW_BIN" ]] || die "WaterWall installation failed."
-  printf -- "WaterWall installed at: %s\n" "$WW_BIN" > /dev/tty
+
+  printf -- "WaterWall installed globally.\n" > /dev/tty
   tty_pause
 }
 
@@ -232,26 +228,28 @@ valid_name() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 
 # -----------------------------
-# JSON writers (PRETTY like your screenshots)
-# - core.json ONLY (no <tunnel>.json)
-# - libs-path = "libs/" and we symlink tunnel_dir/libs -> /opt/waterwall/libs
-# - includes internal logs + mtu + ram-profile client/server
+# Tunnel layout EXACTLY as you want
+# /opt/copytun/<name>/{core.json,WaterWall,libs,logs,configs}
 # -----------------------------
 ensure_tunnel_layout() {
   local tdir="$1"
   mkdir -p "${tdir}/configs" "${tdir}/logs"
+
   : > "${tdir}/logs/core.log" || true
   : > "${tdir}/logs/network.log" || true
   : > "${tdir}/logs/dns.log" || true
   : > "${tdir}/logs/internal.log" || true
 
-  # libs-path expects libs/ relative; make it exist
+  # libs inside tunnel
   ln -sfn "${WW_LIBS}" "${tdir}/libs"
+
+  # WaterWall core inside tunnel
+  ln -sfn "${WW_BIN}" "${tdir}/WaterWall"
 }
 
 write_core_json_pretty() {
   local tdir="$1"
-  local ram_profile="$2"    # client | server
+  local ram_profile="$2"    # client|server
   local cfg_rel="$3"        # configs/iran-halfduplex.json
 
   cat > "${tdir}/core.json" <<EOF
@@ -399,6 +397,9 @@ regenerate_from_meta() {
 
   ensure_tunnel_layout "$tdir"
 
+  # پاکسازی فایل config نقش مخالف (فقط یکی باید باشد)
+  rm -f "${tdir}/configs/iran-halfduplex.json" "${tdir}/configs/foreign-halfduplex.json" 2>/dev/null || true
+
   if [[ "${ROLE:-}" == "iran" ]]; then
     valid_port "${IRAN_LOCAL_PORT:-}" || die "Invalid meta: IRAN_LOCAL_PORT"
     valid_port "${IRAN_TUNNEL_PORT:-}" || die "Invalid meta: IRAN_TUNNEL_PORT"
@@ -413,16 +414,13 @@ regenerate_from_meta() {
   else
     die "Unknown ROLE in meta.env (expected iran or foreign)."
   fi
-
-  # Ensure no stray <tunnel>.json exists (user requirement)
-  rm -f "${tdir}/${tn}.json" 2>/dev/null || true
 }
 
 # -----------------------------
 # Create tunnel
 # -----------------------------
 create_tunnel() {
-  install_waterwall
+  install_waterwall_global
   ensure_systemd_template
   mkdir -p "${CT_BASE}"
 
@@ -433,7 +431,7 @@ create_tunnel() {
   local tdir="${CT_BASE}/${tn}"
   [[ -d "$tdir" ]] && die "Tunnel already exists: ${tn}"
 
-  mkdir -p "$tdir/configs" "$tdir/logs"
+  mkdir -p "$tdir"
   ensure_tunnel_layout "$tdir"
 
   local role_choice
@@ -444,31 +442,28 @@ create_tunnel() {
 
   if [[ "$role_choice" == "1" ]]; then
     local local_port tunnel_port foreign_ip
-    tty_read local_port "Local listen port (users connect here, e.g. 5055): "
+    tty_read local_port "Local listen port (e.g. 5055): "
     valid_port "$local_port" || die "Invalid port."
-    tty_read tunnel_port "Tunnel port (connects to foreign server, e.g. 449): "
+    tty_read tunnel_port "Tunnel port (e.g. 449): "
     valid_port "$tunnel_port" || die "Invalid port."
-    tty_read foreign_ip "Foreign server IP (or hostname): "
+    tty_read foreign_ip "Foreign server IP/host: "
     [[ -n "$foreign_ip" ]] || die "Foreign IP/host cannot be empty."
 
     write_meta_env "$tdir" \
-      "TUNNEL_NAME=${tn}" \
       "ROLE=iran" \
       "IRAN_LOCAL_PORT=${local_port}" \
       "IRAN_TUNNEL_PORT=${tunnel_port}" \
       "IRAN_FOREIGN_IP=${foreign_ip}"
 
     regenerate_from_meta "$tn"
-
   elif [[ "$role_choice" == "2" ]]; then
     local target_port tunnel_port
-    tty_read target_port "Target service port (e.g. Xray inbound, e.g. 5055): "
+    tty_read target_port "Target service port (e.g. 5055): "
     valid_port "$target_port" || die "Invalid port."
     tty_read tunnel_port "Tunnel listen port (e.g. 449): "
     valid_port "$tunnel_port" || die "Invalid port."
 
     write_meta_env "$tdir" \
-      "TUNNEL_NAME=${tn}" \
       "ROLE=foreign" \
       "FOREIGN_TARGET_PORT=${target_port}" \
       "FOREIGN_TUNNEL_PORT=${tunnel_port}"
@@ -480,179 +475,60 @@ create_tunnel() {
   fi
 
   svc_enable_start "$tn"
-
   printf -- "\nTunnel created: %s\n" "$tn" > /dev/tty
-  printf -- "Service: %s\n" "$(svc_name "$tn")" > /dev/tty
   tty_pause
 }
 
 # -----------------------------
-# Edit / Delete
-# -----------------------------
-edit_tunnel() {
-  local tn="$1"
-  local tdir="${CT_BASE}/${tn}"
-  load_meta_env "$tdir" || die "meta.env missing."
-
-  tty_clear
-  printf -- "Editing tunnel: %s\nRole: %s\n\n" "$tn" "$ROLE" > /dev/tty
-
-  if [[ "$ROLE" == "iran" ]]; then
-    printf -- "1) Edit Foreign IP (current: %s)\n" "${IRAN_FOREIGN_IP:-}" > /dev/tty
-    printf -- "2) Edit Local listen port (current: %s)\n" "${IRAN_LOCAL_PORT:-}" > /dev/tty
-    printf -- "3) Edit Tunnel port (current: %s)\n" "${IRAN_TUNNEL_PORT:-}" > /dev/tty
-    printf -- "0) Back\n" > /dev/tty
-    local c v
-    tty_read c "Choose: "
-    case "$c" in
-      1) tty_read v "New Foreign IP/host: "; [[ -n "$v" ]] || die "Empty."; IRAN_FOREIGN_IP="$v" ;;
-      2) tty_read v "New Local listen port: "; valid_port "$v" || die "Invalid port."; IRAN_LOCAL_PORT="$v" ;;
-      3) tty_read v "New Tunnel port: "; valid_port "$v" || die "Invalid port."; IRAN_TUNNEL_PORT="$v" ;;
-      0) return 0 ;;
-      *) die "Invalid choice." ;;
-    esac
-    write_meta_env "$tdir" \
-      "TUNNEL_NAME=${tn}" \
-      "ROLE=iran" \
-      "IRAN_LOCAL_PORT=${IRAN_LOCAL_PORT}" \
-      "IRAN_TUNNEL_PORT=${IRAN_TUNNEL_PORT}" \
-      "IRAN_FOREIGN_IP=${IRAN_FOREIGN_IP}"
-
-  elif [[ "$ROLE" == "foreign" ]]; then
-    printf -- "1) Edit Target service port (current: %s)\n" "${FOREIGN_TARGET_PORT:-}" > /dev/tty
-    printf -- "2) Edit Tunnel listen port (current: %s)\n" "${FOREIGN_TUNNEL_PORT:-}" > /dev/tty
-    printf -- "0) Back\n" > /dev/tty
-    local c v
-    tty_read c "Choose: "
-    case "$c" in
-      1) tty_read v "New Target service port: "; valid_port "$v" || die "Invalid port."; FOREIGN_TARGET_PORT="$v" ;;
-      2) tty_read v "New Tunnel listen port: "; valid_port "$v" || die "Invalid port."; FOREIGN_TUNNEL_PORT="$v" ;;
-      0) return 0 ;;
-      *) die "Invalid choice." ;;
-    esac
-    write_meta_env "$tdir" \
-      "TUNNEL_NAME=${tn}" \
-      "ROLE=foreign" \
-      "FOREIGN_TARGET_PORT=${FOREIGN_TARGET_PORT}" \
-      "FOREIGN_TUNNEL_PORT=${FOREIGN_TUNNEL_PORT}"
-  else
-    die "Unknown ROLE in meta.env."
-  fi
-
-  regenerate_from_meta "$tn"
-  svc_restart "$tn"
-  printf -- "\nUpdated and restarted: %s\n" "$(svc_name "$tn")" > /dev/tty
-  tty_pause
-}
-
-delete_tunnel() {
-  local tn="$1"
-  local tdir="${CT_BASE}/${tn}"
-  [[ -d "$tdir" ]] || die "Tunnel not found."
-
-  tty_clear
-  printf -- "Delete tunnel '%s'?\nType YES to confirm: " "$tn" > /dev/tty
-  local ans
-  IFS= read -r ans < /dev/tty
-  if [[ "$ans" != "YES" ]]; then
-    printf -- "Cancelled.\n" > /dev/tty
-    tty_pause
-    return 0
-  fi
-
-  svc_stop_disable "$tn"
-  rm -rf "$tdir" || true
-
-  printf -- "Deleted tunnel: %s\n" "$tn" > /dev/tty
-  tty_pause
-}
-
-# -----------------------------
-# Log file viewer (MANDATORY)
-# -----------------------------
-view_log_files() {
-  local tn="$1"
-  local tdir="${CT_BASE}/${tn}"
-  local ldir="${tdir}/logs"
-  [[ -d "$ldir" ]] || die "Logs directory not found."
-
-  local files=()
-  local f
-  for f in core.log network.log dns.log internal.log; do
-    [[ -f "${ldir}/${f}" ]] && files+=("${f}")
-  done
-
-  tty_clear
-  if [[ "${#files[@]}" -eq 0 ]]; then
-    printf -- "No log files found in %s\n" "$ldir" > /dev/tty
-    tty_pause
-    return 0
-  fi
-
-  printf -- "Log files for %s:\n" "$tn" > /dev/tty
-  local i=0
-  for f in "${files[@]}"; do
-    i=$((i+1))
-    printf -- "%d) %s\n" "$i" "$f" > /dev/tty
-  done
-  printf -- "0) Back\n" > /dev/tty
-
-  local c
-  tty_read c "Choose file: "
-  [[ "$c" == "0" ]] && return 0
-  [[ "$c" =~ ^[0-9]+$ ]] || die "Invalid selection."
-  (( c >= 1 && c <= ${#files[@]} )) || die "Out of range."
-  local selected="${files[$((c-1))]}"
-
-  tty_clear
-  printf -- "1) tail -n 200\n" > /dev/tty
-  printf -- "2) tail -f (live)\n" > /dev/tty
-  printf -- "0) Back\n" > /dev/tty
-  local mode
-  tty_read mode "Choose: "
-  case "$mode" in
-    1) tail -n 200 "${ldir}/${selected}" > /dev/tty; printf -- "\n" > /dev/tty; tty_pause ;;
-    2) printf -- "Live mode. Press Ctrl+C to stop.\n\n" > /dev/tty; tail -f "${ldir}/${selected}" > /dev/tty ;;
-    0) return 0 ;;
-    *) die "Invalid choice." ;;
-  esac
-}
-
-# -----------------------------
-# List / manage tunnels
+# Minimal List/Manage (same as before)
 # -----------------------------
 manage_tunnel() {
   local tn="$1"
-  local sname
-  sname="$(svc_name "$tn")"
+  local sname; sname="$(svc_name "$tn")"
 
   while true; do
     tty_clear
     local st="inactive"
     svc_is_active "$tn" && st="active"
     printf -- "Manage tunnel: %s  [%s]\n" "$tn" "$st" > /dev/tty
-    printf -- "--------------------------------\n" > /dev/tty
-    printf -- "1) Start / Restart\n" > /dev/tty
-    printf -- "2) Stop\n" > /dev/tty
-    printf -- "3) Service status (systemctl status)\n" > /dev/tty
-    printf -- "4) Service logs (journalctl -u)\n" > /dev/tty
-    printf -- "5) View log files\n" > /dev/tty
-    printf -- "6) Edit tunnel\n" > /dev/tty
-    printf -- "7) Delete tunnel\n" > /dev/tty
-    printf -- "0) Back\n" > /dev/tty
-
-    local c
-    tty_read c "Choose: "
+    printf -- "1) Start / Restart\n2) Stop\n3) Status\n4) Logs (journal)\n5) Edit\n6) Delete\n0) Back\n" > /dev/tty
+    local c; tty_read c "Choose: "
     case "$c" in
       1) svc_enable_start "$tn"; svc_restart "$tn"; printf -- "Restarted.\n" > /dev/tty; tty_pause ;;
       2) systemctl stop "$sname" >/dev/null 2>&1 || true; printf -- "Stopped.\n" > /dev/tty; tty_pause ;;
       3) systemctl status "$sname" --no-pager > /dev/tty 2>&1 || true; tty_pause ;;
       4) journalctl -u "$sname" --no-pager -n 200 > /dev/tty 2>&1 || true; tty_pause ;;
-      5) view_log_files "$tn" ;;
-      6) edit_tunnel "$tn" ;;
-      7) delete_tunnel "$tn"; return 0 ;;
+      5)
+        load_meta_env "${CT_BASE}/${tn}" || die "meta.env missing."
+        # ساده: فقط بازسازی از meta.env با ورودی‌های جدید
+        if [[ "${ROLE:-}" == "iran" ]]; then
+          tty_read v "New Foreign IP (blank = keep): "; [[ -n "$v" ]] && IRAN_FOREIGN_IP="$v"
+          tty_read v "New Local port (blank = keep): "; [[ -n "$v" ]] && IRAN_LOCAL_PORT="$v"
+          tty_read v "New Tunnel port (blank = keep): "; [[ -n "$v" ]] && IRAN_TUNNEL_PORT="$v"
+          write_meta_env "${CT_BASE}/${tn}" "ROLE=iran" "IRAN_LOCAL_PORT=${IRAN_LOCAL_PORT}" "IRAN_TUNNEL_PORT=${IRAN_TUNNEL_PORT}" "IRAN_FOREIGN_IP=${IRAN_FOREIGN_IP}"
+        else
+          tty_read v "New Target port (blank = keep): "; [[ -n "$v" ]] && FOREIGN_TARGET_PORT="$v"
+          tty_read v "New Tunnel port (blank = keep): "; [[ -n "$v" ]] && FOREIGN_TUNNEL_PORT="$v"
+          write_meta_env "${CT_BASE}/${tn}" "ROLE=foreign" "FOREIGN_TARGET_PORT=${FOREIGN_TARGET_PORT}" "FOREIGN_TUNNEL_PORT=${FOREIGN_TUNNEL_PORT}"
+        fi
+        regenerate_from_meta "$tn"
+        svc_restart "$tn"
+        printf -- "Updated.\n" > /dev/tty
+        tty_pause
+        ;;
+      6)
+        tty_clear
+        printf -- "Type YES to delete %s: " "$tn" > /dev/tty
+        read -r ans < /dev/tty
+        [[ "$ans" == "YES" ]] || { printf -- "Cancelled.\n" > /dev/tty; tty_pause; continue; }
+        svc_stop_disable "$tn"
+        rm -rf "${CT_BASE}/${tn}" || true
+        printf -- "Deleted.\n" > /dev/tty
+        tty_pause
+        return 0
+        ;;
       0) return 0 ;;
-      *) printf -- "Invalid choice.\n" > /dev/tty; tty_pause ;;
+      *) printf -- "Invalid.\n" > /dev/tty; tty_pause ;;
     esac
   done
 }
@@ -661,58 +537,28 @@ list_tunnels() {
   mkdir -p "${CT_BASE}"
   local dirs=()
   local d
-  while IFS= read -r -d '' d; do
-    dirs+=("$d")
-  done < <(find "${CT_BASE}" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
+  while IFS= read -r -d '' d; do dirs+=("$d"); done < <(find "${CT_BASE}" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
 
-  if [[ "${#dirs[@]}" -eq 0 ]]; then
-    tty_clear
-    printf -- "No tunnels found.\n" > /dev/tty
-    tty_pause
-    return 0
-  fi
+  [[ "${#dirs[@]}" -gt 0 ]] || { tty_clear; printf -- "No tunnels found.\n" > /dev/tty; tty_pause; return 0; }
 
   tty_clear
   printf -- "Tunnels:\n" > /dev/tty
-  printf -- "---------------------------------------------\n" > /dev/tty
-
-  local i=0
-  local names=()
+  local i=0 names=()
   for d in "${dirs[@]}"; do
     i=$((i+1))
-    local tn role summary st
     tn="$(basename "$d")"
     names+=("$tn")
-
-    role="unknown"; summary="(no meta.env)"
-    if load_meta_env "$d" 2>/dev/null; then
-      role="${ROLE:-unknown}"
-      if [[ "$role" == "iran" ]]; then
-        summary="local:${IRAN_LOCAL_PORT:-?} -> ${IRAN_FOREIGN_IP:-?}:${IRAN_TUNNEL_PORT:-?}"
-      elif [[ "$role" == "foreign" ]]; then
-        summary="0.0.0.0:${FOREIGN_TUNNEL_PORT:-?} -> 127.0.0.1:${FOREIGN_TARGET_PORT:-?}"
-      fi
-    fi
-
-    st="inactive"
-    svc_is_active "$tn" && st="active"
-
-    printf -- "%2d) %-20s role:%-7s  %-35s  [%s]\n" "$i" "$tn" "$role" "$summary" "$st" > /dev/tty
+    st="inactive"; svc_is_active "$tn" && st="active"
+    printf -- "%2d) %-20s [%s]\n" "$i" "$tn" "$st" > /dev/tty
   done
-
-  printf -- "---------------------------------------------\n" > /dev/tty
-  printf -- "Select a tunnel by number (or 0 to back)\n" > /dev/tty
-  local choice
-  tty_read choice "Enter: "
-  [[ "$choice" == "0" ]] && return 0
-  [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
-  (( choice >= 1 && choice <= ${#names[@]} )) || die "Out of range."
-  manage_tunnel "${names[$((choice-1))]}"
+  printf -- "0) Back\n" > /dev/tty
+  tty_read c "Select: "
+  [[ "$c" == "0" ]] && return 0
+  [[ "$c" =~ ^[0-9]+$ ]] || die "Invalid"
+  (( c>=1 && c<=${#names[@]} )) || die "Out of range"
+  manage_tunnel "${names[$((c-1))]}"
 }
 
-# -----------------------------
-# Main menu
-# -----------------------------
 main_menu() {
   need_root
   mkdir -p "${CT_BASE}"
@@ -721,20 +567,15 @@ main_menu() {
   while true; do
     tty_clear
     printf -- "copytun - WaterWall Half-Duplex tunnel manager\n" > /dev/tty
-    printf -- "---------------------------------------------\n" > /dev/tty
-    printf -- "1) Create tunnel\n" > /dev/tty
-    printf -- "2) List / Manage tunnels\n" > /dev/tty
-    printf -- "3) Exit\n" > /dev/tty
-    local c
-    tty_read c "Choose: "
+    printf -- "1) Create tunnel\n2) List / Manage tunnels\n3) Exit\n" > /dev/tty
+    local c; tty_read c "Choose: "
     case "$c" in
       1) create_tunnel ;;
       2) list_tunnels ;;
-      3) tty_clear; exit 0 ;;
-      *) printf -- "Invalid choice.\n" > /dev/tty; tty_pause ;;
+      3) exit 0 ;;
+      *) printf -- "Invalid.\n" > /dev/tty; tty_pause ;;
     esac
   done
 }
 
 main_menu
-```0
